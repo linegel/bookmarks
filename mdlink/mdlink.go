@@ -11,6 +11,7 @@
 // Core logic:
 // - Sections: # headings only, end at next #
 // - Subsections: > blockquotes (direct children before any heading) OR ## headings
+// - Link metadata: > quotes after * links are ignored
 // - Duplicates: per-section, same URL OK across sections
 
 package main
@@ -23,7 +24,7 @@ import (
 	"strings"
 )
 
-const version = "0.11.0"
+const version = "0.14.0"
 
 type Line struct {
 	text  string
@@ -34,7 +35,7 @@ type Subsection struct {
 	Name      string
 	StartLine int
 	EndLine   int
-	IsQuote   bool // true if "> ", false if heading
+	IsQuote   bool
 }
 
 type Section struct {
@@ -103,6 +104,12 @@ func normalize(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// isLinkLine: true if line starts with "* ["
+func isLinkLine(text string) bool {
+	trim := strings.TrimSpace(text)
+	return strings.HasPrefix(trim, "* [")
+}
+
 // parseDocument: extract top-level sections (# only)
 // Section boundary: next # heading (## and ### don't stop it)
 func parseDocument(lines []Line) *Document {
@@ -136,14 +143,12 @@ func parseDocument(lines []Line) *Document {
 	return doc
 }
 
-// parseSubsections: find > blockquotes AND ## headings
-// Blockquotes: level-0 text before first heading, prefixed "> "
-// Headings: any level > 1
+// parseSubsections: find > blockquotes (skip link metadata) AND ## headings
 func parseSubsections(lines []Line, section *Section) []*Subsection {
 	var subs []*Subsection
 
-	// Pass 1: collect ALL blockquotes in direct block
-	// A blockquote is any level-0 line starting with "> " BEFORE any heading
+	// Pass 1: collect blockquotes before first heading
+	// Skip > lines that immediately follow * links (metadata)
 	firstHeadingIdx := -1
 	for i := section.StartLine + 1; i <= section.EndLine; i++ {
 		if lines[i].level > 0 {
@@ -152,15 +157,25 @@ func parseSubsections(lines []Line, section *Section) []*Subsection {
 		}
 	}
 
-	// Scan blockquotes only from section start to first heading (or section end)
 	quoteEnd := section.EndLine
 	if firstHeadingIdx >= 0 {
 		quoteEnd = firstHeadingIdx - 1
 	}
 
-	for i := section.StartLine + 1; i <= quoteEnd; i++ {
+	i := section.StartLine + 1
+	for i <= quoteEnd {
 		trim := strings.TrimSpace(lines[i].text)
-		if strings.HasPrefix(trim, "> ") {
+
+		// Check if this > is metadata (previous line is link)
+		isMetadata := false
+		if i > section.StartLine+1 {
+			prevTrim := strings.TrimSpace(lines[i-1].text)
+			if isLinkLine(lines[i-1].text) || strings.HasPrefix(prevTrim, "> ") {
+				isMetadata = true
+			}
+		}
+
+		if strings.HasPrefix(trim, "> ") && !isMetadata {
 			label := strings.TrimSpace(strings.TrimPrefix(trim, "> "))
 			sub := &Subsection{
 				Name:      label,
@@ -169,16 +184,27 @@ func parseSubsections(lines []Line, section *Section) []*Subsection {
 				EndLine:   i,
 			}
 
-			// Find end of blockquote block: next blockquote or next heading
+			// Find end: next quote block start or heading
 			for j := i + 1; j <= section.EndLine; j++ {
 				if lines[j].level > 0 {
 					sub.EndLine = j - 1
 					break
 				}
-				trim := strings.TrimSpace(lines[j].text)
-				if strings.HasPrefix(trim, "> ") {
-					sub.EndLine = j - 1
-					break
+				nextTrim := strings.TrimSpace(lines[j].text)
+				if strings.HasPrefix(nextTrim, "> ") {
+					// Check if next > is metadata too
+					nextIsMetadata := false
+					if j > i {
+						prevTrim := strings.TrimSpace(lines[j-1].text)
+						if isLinkLine(lines[j-1].text) || strings.HasPrefix(prevTrim, "> ") {
+							nextIsMetadata = true
+						}
+					}
+					if !nextIsMetadata {
+						// Next quote is a new block
+						sub.EndLine = j - 1
+						break
+					}
 				}
 				if j == section.EndLine {
 					sub.EndLine = j
@@ -186,6 +212,9 @@ func parseSubsections(lines []Line, section *Section) []*Subsection {
 			}
 
 			subs = append(subs, sub)
+			i = sub.EndLine + 1
+		} else {
+			i++
 		}
 	}
 
@@ -200,7 +229,6 @@ func parseSubsections(lines []Line, section *Section) []*Subsection {
 				EndLine:   i,
 			}
 
-			// Find heading end: next heading of same/lower level
 			for j := i + 1; j <= section.EndLine; j++ {
 				if lines[j].level > 0 && lines[j].level <= lines[i].level {
 					sub.EndLine = j - 1
@@ -250,7 +278,7 @@ func findSubsectionInSection(section *Section, subsection string) *Subsection {
 func countListItems(lines []Line, startIdx int, endIdx int) int {
 	count := 0
 	for i := startIdx; i <= endIdx && i < len(lines); i++ {
-		if strings.HasPrefix(strings.TrimSpace(lines[i].text), "* ") {
+		if isLinkLine(lines[i].text) {
 			count++
 		}
 	}
@@ -329,9 +357,8 @@ func cmdList(file, section string) {
 			fmt.Printf("  %s %s (lines %d-%d)\n", marker, sub.Name, sub.StartLine+1, sub.EndLine+1)
 		}
 		fmt.Println()
-		linkRe := regexp.MustCompile(`^\s*\*\s+\[`)
 		for i := sec.StartLine; i <= sec.EndLine && i < len(lines); i++ {
-			if linkRe.MatchString(lines[i].text) {
+			if isLinkLine(lines[i].text) {
 				title, url := parseLink(lines[i].text)
 				fmt.Printf("  [%d] %s (%s)\n", i+1, title, url)
 			}
@@ -430,7 +457,7 @@ COMMANDS:
   update <file> <old_url> <new_url> <title>
 
 Sections: # only
-Subsections: > blockquotes (before first heading) OR ## headings
+Subsections: > blockquotes (skip link metadata) OR ## headings
 `)
 }
 
