@@ -24,7 +24,7 @@ import (
 	"strings"
 )
 
-const version = "0.8.1"
+const version = "0.8.5"
 
 type Line struct {
 	text  string
@@ -341,7 +341,7 @@ func cmdInsert(file, url, title, section, subsection string) {
 	}
 
 	newLink := fmt.Sprintf("* [%s](%s)", title, url)
-	var insertIdx int
+	var endOfContent int
 
 	if subsection != "" {
 		// Explicit subsection requested
@@ -350,32 +350,34 @@ func cmdInsert(file, url, title, section, subsection string) {
 			fmt.Printf("Subsection '%s' not found under '%s'\n", subsection, section)
 			os.Exit(1)
 		}
-		insertIdx = sub.EndLine + 1
+		endOfContent = sub.EndLine
 	} else {
 		// No subsection: use best arrow subsection or section end
 		bestSub := chooseBestArrowSubsection(lines, sec)
 		if bestSub != nil {
-			insertIdx = bestSub.EndLine + 1
+			endOfContent = bestSub.EndLine
 		} else {
-			insertIdx = sec.EndLine + 1
+			endOfContent = sec.EndLine
 		}
 	}
 
-	// Bounds check: ensure we stay within section
-	if insertIdx > sec.EndLine+1 {
-		insertIdx = sec.EndLine + 1
+	// Find last non-blank line in content
+	insertIdx := endOfContent
+	for insertIdx > 0 && strings.TrimSpace(lines[insertIdx].text) == "" {
+		insertIdx--
+	}
+	insertIdx++
+
+	// Remove blank lines at insertion point, keep max one
+	for insertIdx < len(lines) && strings.TrimSpace(lines[insertIdx].text) == "" {
+		lines = append(lines[:insertIdx], lines[insertIdx+1:]...)
 	}
 
-	// Build new lines with spacing
+	// Build new lines: insert link
 	newLines := make([]Line, 0, len(lines)+2)
 	newLines = append(newLines, lines[:insertIdx]...)
 	newLines = append(newLines, Line{newLink, 0})
-
 	if insertIdx < len(lines) {
-		if strings.TrimSpace(lines[insertIdx].text) != "" {
-			newLines = append(newLines, Line{"", 0})
-		}
-	} else {
 		newLines = append(newLines, Line{"", 0})
 	}
 	newLines = append(newLines, lines[insertIdx:]...)
