@@ -8,11 +8,10 @@
 //   mdlink --help
 //   mdlink --version
 //
-// Notes:
-// - Sections matched case-insensitive, ampersand-safe.
-// - Arrow-style subsections recognized ONLY as lines starting with "-> ".
-// - Internal document model ensures insertions never cross section boundaries.
-// - Top-level sections stop at ANY deeper heading level, not just same level.
+// Core logic:
+// - Sections: # headings only, end at next #
+// - Subsections: > blockquotes (direct children before any heading) OR ## headings
+// - Duplicates: per-section, same URL OK across sections
 
 package main
 
@@ -24,31 +23,28 @@ import (
 	"strings"
 )
 
-const version = "0.8.5"
+const version = "0.11.0"
 
 type Line struct {
 	text  string
-	level int // heading level (0 if not heading)
+	level int
 }
 
-// Section represents a top-level section (content before any nested heading)
-type Section struct {
-	Name       string
-	StartLine  int
-	EndLine    int
-	Level      int
-	Subsections []*Subsection
-}
-
-// Subsection represents an arrow-style subsection with bounds
 type Subsection struct {
 	Name      string
 	StartLine int
 	EndLine   int
-	IsArrow   bool
+	IsQuote   bool // true if "> ", false if heading
 }
 
-// Document represents the parsed markdown structure
+type Section struct {
+	Name        string
+	StartLine   int
+	EndLine     int
+	Level       int
+	Subsections []*Subsection
+}
+
 type Document struct {
 	Lines    []Line
 	Sections []*Section
@@ -107,14 +103,13 @@ func normalize(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// parseDocument builds internal model of top-level sections only
-// Top-level sections are defined as: content that stops when ANY heading is encountered
-// (not just same-level headings)
+// parseDocument: extract top-level sections (# only)
+// Section boundary: next # heading (## and ### don't stop it)
 func parseDocument(lines []Line) *Document {
 	doc := &Document{Lines: lines, Sections: []*Section{}}
 
 	for i := 0; i < len(lines); i++ {
-		if lines[i].level == 0 {
+		if lines[i].level != 1 {
 			continue
 		}
 
@@ -123,20 +118,17 @@ func parseDocument(lines []Line) *Document {
 			Name:      title,
 			StartLine: i,
 			EndLine:   len(lines) - 1,
-			Level:     lines[i].level,
+			Level:     1,
 		}
 
-		// Find section end: next heading of ANY kind stops this section
 		for j := i + 1; j < len(lines); j++ {
-			if lines[j].level > 0 {
+			if lines[j].level == 1 {
 				section.EndLine = j - 1
 				break
 			}
 		}
 
-		// Parse arrow subsections in the section (they don't include nested headings)
-		section.Subsections = parseArrowSubsections(lines, i, section.EndLine, section.Level)
-
+		section.Subsections = parseSubsections(lines, section)
 		doc.Sections = append(doc.Sections, section)
 		i = section.EndLine
 	}
@@ -144,38 +136,77 @@ func parseDocument(lines []Line) *Document {
 	return doc
 }
 
-// parseArrowSubsections finds arrow-style subsections before any nested heading
-func parseArrowSubsections(lines []Line, sectionStart int, sectionEnd int, sectionLevel int) []*Subsection {
+// parseSubsections: find > blockquotes AND ## headings
+// Blockquotes: level-0 text before first heading, prefixed "> "
+// Headings: any level > 1
+func parseSubsections(lines []Line, section *Section) []*Subsection {
 	var subs []*Subsection
 
-	// Scan from sectionStart+1 until we hit ANY nested heading (level > sectionLevel)
-	for i := sectionStart + 1; i <= sectionEnd; i++ {
-		if lines[i].level > sectionLevel {
-			// Nested heading: stop direct content scan
+	// Pass 1: collect ALL blockquotes in direct block
+	// A blockquote is any level-0 line starting with "> " BEFORE any heading
+	firstHeadingIdx := -1
+	for i := section.StartLine + 1; i <= section.EndLine; i++ {
+		if lines[i].level > 0 {
+			firstHeadingIdx = i
 			break
 		}
+	}
 
+	// Scan blockquotes only from section start to first heading (or section end)
+	quoteEnd := section.EndLine
+	if firstHeadingIdx >= 0 {
+		quoteEnd = firstHeadingIdx - 1
+	}
+
+	for i := section.StartLine + 1; i <= quoteEnd; i++ {
 		trim := strings.TrimSpace(lines[i].text)
-		if strings.HasPrefix(trim, "-> ") {
-			label := strings.TrimSpace(strings.TrimPrefix(trim, "-> "))
+		if strings.HasPrefix(trim, "> ") {
+			label := strings.TrimSpace(strings.TrimPrefix(trim, "> "))
 			sub := &Subsection{
 				Name:      label,
 				StartLine: i,
-				IsArrow:   true,
+				IsQuote:   true,
+				EndLine:   i,
 			}
 
-			// Find end of arrow block: next arrow, nested heading, or section end
-			for j := i + 1; j <= sectionEnd; j++ {
-				if lines[j].level > sectionLevel {
+			// Find end of blockquote block: next blockquote or next heading
+			for j := i + 1; j <= section.EndLine; j++ {
+				if lines[j].level > 0 {
 					sub.EndLine = j - 1
 					break
 				}
 				trim := strings.TrimSpace(lines[j].text)
-				if strings.HasPrefix(trim, "-> ") {
+				if strings.HasPrefix(trim, "> ") {
 					sub.EndLine = j - 1
 					break
 				}
-				if j == sectionEnd {
+				if j == section.EndLine {
+					sub.EndLine = j
+				}
+			}
+
+			subs = append(subs, sub)
+		}
+	}
+
+	// Pass 2: collect all headings (## and deeper)
+	for i := section.StartLine + 1; i <= section.EndLine; i++ {
+		if lines[i].level > 1 {
+			label := getHeadingTitle(lines[i].text)
+			sub := &Subsection{
+				Name:      label,
+				StartLine: i,
+				IsQuote:   false,
+				EndLine:   i,
+			}
+
+			// Find heading end: next heading of same/lower level
+			for j := i + 1; j <= section.EndLine; j++ {
+				if lines[j].level > 0 && lines[j].level <= lines[i].level {
+					sub.EndLine = j - 1
+					break
+				}
+				if j == section.EndLine {
 					sub.EndLine = j
 				}
 			}
@@ -196,7 +227,6 @@ func findLinkInLines(lines []Line, url string) (int, string) {
 	return -1, ""
 }
 
-// findSectionInDoc returns section by name from document
 func findSectionInDoc(doc *Document, section string) *Section {
 	normSection := normalize(section)
 	for _, sec := range doc.Sections {
@@ -207,7 +237,6 @@ func findSectionInDoc(doc *Document, section string) *Section {
 	return nil
 }
 
-// findSubsectionInSection returns subsection by name within section
 func findSubsectionInSection(section *Section, subsection string) *Subsection {
 	normSub := normalize(subsection)
 	for _, sub := range section.Subsections {
@@ -218,7 +247,6 @@ func findSubsectionInSection(section *Section, subsection string) *Subsection {
 	return nil
 }
 
-// countListItems in a range
 func countListItems(lines []Line, startIdx int, endIdx int) int {
 	count := 0
 	for i := startIdx; i <= endIdx && i < len(lines); i++ {
@@ -229,31 +257,35 @@ func countListItems(lines []Line, startIdx int, endIdx int) int {
 	return count
 }
 
-// chooseBestArrowSubsection: prefer Learn, else most items
-func chooseBestArrowSubsection(lines []Line, section *Section) *Subsection {
-	if len(section.Subsections) == 0 {
+func chooseBestQuoteSubsection(lines []Line, section *Section) *Subsection {
+	var quotes []*Subsection
+	for _, sub := range section.Subsections {
+		if sub.IsQuote {
+			quotes = append(quotes, sub)
+		}
+	}
+
+	if len(quotes) == 0 {
 		return nil
 	}
 
-	// First pass: look for Learn
-	for _, sub := range section.Subsections {
+	// Prefer "Learn"
+	for _, sub := range quotes {
 		if normalize(sub.Name) == normalize("Learn") {
 			return sub
 		}
 	}
 
-	// Fallback: most items
-	best := section.Subsections[len(section.Subsections)-1]
+	// Else: most items
+	best := quotes[len(quotes)-1]
 	bestCount := -1
-
-	for _, sub := range section.Subsections {
+	for _, sub := range quotes {
 		count := countListItems(lines, sub.StartLine+1, sub.EndLine)
-		if count > bestCount || (count == bestCount && sub.StartLine >= best.StartLine) {
+		if count > bestCount {
 			bestCount = count
 			best = sub
 		}
 	}
-
 	return best
 }
 
@@ -267,11 +299,7 @@ func parseLink(text string) (string, string) {
 }
 
 func cmdFind(file, url string) {
-	lines, err := readFile(file)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
+	lines, _ := readFile(file)
 	idx, text := findLinkInLines(lines, url)
 	if idx < 0 {
 		fmt.Println("NOT_FOUND")
@@ -283,12 +311,7 @@ func cmdFind(file, url string) {
 }
 
 func cmdList(file, section string) {
-	lines, err := readFile(file)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
+	lines, _ := readFile(file)
 	doc := parseDocument(lines)
 
 	if section != "" {
@@ -299,10 +322,13 @@ func cmdList(file, section string) {
 		}
 		fmt.Printf("# %s (lines %d-%d)\n", sec.Name, sec.StartLine+1, sec.EndLine+1)
 		for _, sub := range sec.Subsections {
-			fmt.Printf("  -> %s (lines %d-%d)\n", sub.Name, sub.StartLine+1, sub.EndLine+1)
+			marker := ">"
+			if !sub.IsQuote {
+				marker = "##"
+			}
+			fmt.Printf("  %s %s (lines %d-%d)\n", marker, sub.Name, sub.StartLine+1, sub.EndLine+1)
 		}
 		fmt.Println()
-
 		linkRe := regexp.MustCompile(`^\s*\*\s+\[`)
 		for i := sec.StartLine; i <= sec.EndLine && i < len(lines); i++ {
 			if linkRe.MatchString(lines[i].text) {
@@ -315,24 +341,18 @@ func cmdList(file, section string) {
 		for _, sec := range doc.Sections {
 			fmt.Printf("# %s (lines %d-%d)\n", sec.Name, sec.StartLine+1, sec.EndLine+1)
 			for _, sub := range sec.Subsections {
-				fmt.Printf("  -> %s (lines %d-%d)\n", sub.Name, sub.StartLine+1, sub.EndLine+1)
+				marker := ">"
+				if !sub.IsQuote {
+					marker = "##"
+				}
+				fmt.Printf("  %s %s (lines %d-%d)\n", marker, sub.Name, sub.StartLine+1, sub.EndLine+1)
 			}
 		}
 	}
 }
 
 func cmdInsert(file, url, title, section, subsection string) {
-	lines, err := readFile(file)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	if idx, _ := findLinkInLines(lines, url); idx >= 0 {
-		fmt.Println("EXISTS")
-		return
-	}
-
+	lines, _ := readFile(file)
 	doc := parseDocument(lines)
 	sec := findSectionInDoc(doc, section)
 	if sec == nil {
@@ -340,11 +360,17 @@ func cmdInsert(file, url, title, section, subsection string) {
 		os.Exit(1)
 	}
 
+	for i := sec.StartLine; i <= sec.EndLine && i < len(lines); i++ {
+		if strings.Contains(lines[i].text, "]"+url+")") || strings.Contains(lines[i].text, "]("+url) {
+			fmt.Println("EXISTS")
+			return
+		}
+	}
+
 	newLink := fmt.Sprintf("* [%s](%s)", title, url)
 	var endOfContent int
 
 	if subsection != "" {
-		// Explicit subsection requested
 		sub := findSubsectionInSection(sec, subsection)
 		if sub == nil {
 			fmt.Printf("Subsection '%s' not found under '%s'\n", subsection, section)
@@ -352,8 +378,7 @@ func cmdInsert(file, url, title, section, subsection string) {
 		}
 		endOfContent = sub.EndLine
 	} else {
-		// No subsection: use best arrow subsection or section end
-		bestSub := chooseBestArrowSubsection(lines, sec)
+		bestSub := chooseBestQuoteSubsection(lines, sec)
 		if bestSub != nil {
 			endOfContent = bestSub.EndLine
 		} else {
@@ -361,19 +386,16 @@ func cmdInsert(file, url, title, section, subsection string) {
 		}
 	}
 
-	// Find last non-blank line in content
 	insertIdx := endOfContent
 	for insertIdx > 0 && strings.TrimSpace(lines[insertIdx].text) == "" {
 		insertIdx--
 	}
 	insertIdx++
 
-	// Remove blank lines at insertion point, keep max one
 	for insertIdx < len(lines) && strings.TrimSpace(lines[insertIdx].text) == "" {
 		lines = append(lines[:insertIdx], lines[insertIdx+1:]...)
 	}
 
-	// Build new lines: insert link
 	newLines := make([]Line, 0, len(lines)+2)
 	newLines = append(newLines, lines[:insertIdx]...)
 	newLines = append(newLines, Line{newLink, 0})
@@ -382,35 +404,24 @@ func cmdInsert(file, url, title, section, subsection string) {
 	}
 	newLines = append(newLines, lines[insertIdx:]...)
 
-	if err := writeFile(file, newLines); err != nil {
-		fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
-		os.Exit(1)
-	}
+	writeFile(file, newLines)
 	fmt.Printf("INSERTED at line %d\n", insertIdx+1)
 }
 
 func cmdUpdate(file, oldURL, newURL, title string) {
-	lines, err := readFile(file)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
+	lines, _ := readFile(file)
 	idx, _ := findLinkInLines(lines, oldURL)
 	if idx < 0 {
 		fmt.Println("NOT_FOUND")
 		return
 	}
-	newLink := fmt.Sprintf("* [%s](%s)", title, newURL)
-	lines[idx].text = newLink
-	if err := writeFile(file, lines); err != nil {
-		fmt.Fprintf(os.Stderr, "Write error: %v\n", err)
-		os.Exit(1)
-	}
+	lines[idx].text = fmt.Sprintf("* [%s](%s)", title, newURL)
+	writeFile(file, lines)
 	fmt.Printf("UPDATED line %d\n", idx+1)
 }
 
 func showHelp() {
-	help := `mdlink - Markdown Link Manager
+	fmt.Print(`mdlink - Markdown Link Manager
 
 COMMANDS:
   find <file> <url>
@@ -418,10 +429,9 @@ COMMANDS:
   insert <file> <url> <title> <section> [subsection]
   update <file> <old_url> <new_url> <title>
 
-Arrow subsections: "-> Learn", "-> News" supported.
-Section boundaries stop at ANY heading level.
-`
-	fmt.Print(help)
+Sections: # only
+Subsections: > blockquotes (before first heading) OR ## headings
+`)
 }
 
 func main() {
@@ -429,8 +439,7 @@ func main() {
 		showHelp()
 		return
 	}
-	cmd := os.Args[1]
-	switch cmd {
+	switch os.Args[1] {
 	case "--help", "-h", "help":
 		showHelp()
 	case "--version", "-v", "version":
@@ -468,8 +477,7 @@ func main() {
 		}
 		cmdUpdate(os.Args[2], os.Args[3], os.Args[4], os.Args[5])
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
-		showHelp()
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		os.Exit(1)
 	}
 }
